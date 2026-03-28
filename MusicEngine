@@ -1,0 +1,797 @@
+"""
+music_engine.py
+───────────────
+All core logic for the FREQUENCE music recommender.
+Handles: database, Spotify auth, playback, ML scoring, TrueSkill rankings.
+"""
+
+import os
+import sqlite3
+import random
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import trueskill
+from sklearn.decomposition import TruncatedSVD
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import MinMaxScaler
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
+
+# ─────────────────────────────────────────────────────────────────
+#  CONSTANTS
+# ─────────────────────────────────────────────────────────────────
+
+DB_PATH = "music.db"
+
+CONTENT_FEATURES = [
+    "energy", "danceability", "valence",
+    "loudness", "instrumentalness", "bpm"
+]
+
+# All genres available in the Kaggle dataset (extend as needed)
+ALL_GENRES = [
+    "edm", "house", "disco", "dance", "club", "electronic",
+    "techno", "trance", "deep-house", "progressive-house",
+    "tech-house", "electro", "dubstep", "drum-and-bass",
+    "pop", "hip-hop", "r-n-b", "latin", "rock", "indie",
+    "soul", "funk", "jazz", "classical", "country", "metal",
+    "reggae", "blues", "folk", "ambient",
+]
+
+CAMELOT_MAP = {
+    (0,1):"8B",  (0,0):"5A",
+    (1,1):"3B",  (1,0):"12A",
+    (2,1):"10B", (2,0):"7A",
+    (3,1):"5B",  (3,0):"2A",
+    (4,1):"12B", (4,0):"9A",
+    (5,1):"7B",  (5,0):"4A",
+    (6,1):"2B",  (6,0):"11A",
+    (7,1):"9B",  (7,0):"6A",
+    (8,1):"4B",  (8,0):"1A",
+    (9,1):"11B", (9,0):"8A",
+    (10,1):"6B", (10,0):"3A",
+    (11,1):"1B", (11,0):"10A",
+}
+
+SPOTIFY_SCOPES = " ".join([
+    "user-read-recently-played",
+    "user-top-read",
+    "user-read-private",
+    "user-modify-playback-state",
+    "user-read-playback-state",
+    "streaming",
+])
+
+# ─────────────────────────────────────────────────────────────────
+#  DATABASE
+# ─────────────────────────────────────────────────────────────────
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def build_spotify_oauth() -> SpotifyOAuth:
+    return SpotifyOAuth(
+        client_id=os.environ.get("SPOTIPY_CLIENT_ID", ""),
+        client_secret=os.environ.get("SPOTIPY_CLIENT_SECRET", ""),
+        redirect_uri=os.environ.get("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:8501"),
+        scope=SPOTIFY_SCOPES,
+        cache_path=".spotify_cache",
+        open_browser=False,
+    )
+
+
+def init_db(conn: sqlite3.Connection):
+    """Create all tables if they don't exist."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS songs (
+            id              TEXT PRIMARY KEY,
+            name            TEXT,
+            artist          TEXT,
+            bpm             REAL,
+            energy          REAL,
+            danceability    REAL,
+            valence         REAL,
+            loudness        REAL,
+            instrumentalness REAL,
+            key             INTEGER,
+            mode            INTEGER,
+            camelot_key     TEXT,
+            track_genre     TEXT,
+            album_cover_url TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS listening_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            song_id     TEXT,
+            played_at   TEXT,
+            session_id  TEXT,
+            skipped     INTEGER DEFAULT 0,
+            replayed    INTEGER DEFAULT 0,
+            play_time_s REAL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS rankings (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            song_id          TEXT UNIQUE,
+            genre            TEXT,
+            mu               REAL DEFAULT 25.0,
+            sigma            REAL DEFAULT 8.333,
+            comparison_count INTEGER DEFAULT 0,
+            last_updated     TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS comparisons (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            winner_id  TEXT,
+            loser_id   TEXT,
+            genre      TEXT,
+            timestamp  TEXT
+        );
+    """)
+    conn.commit()
+
+
+def load_songs_df(conn: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql("SELECT * FROM songs", conn)
+
+
+def get_available_genres(conn: sqlite3.Connection) -> list[str]:
+    """Return all distinct genres present in the songs table."""
+    result = pd.read_sql(
+        "SELECT DISTINCT track_genre FROM songs WHERE track_genre IS NOT NULL ORDER BY track_genre",
+        conn
+    )
+    return sorted(result["track_genre"].dropna().tolist())
+
+
+def filter_songs_by_genres(
+    conn: sqlite3.Connection,
+    genres: list[str]
+) -> pd.DataFrame:
+    if not genres:
+        return pd.read_sql("SELECT * FROM songs", conn)
+    placeholders = ",".join(["?"] * len(genres))
+    return pd.read_sql(
+        f"SELECT * FROM songs WHERE track_genre IN ({placeholders})",
+        conn, params=genres
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+#  SCALER (fit once on all songs)
+# ─────────────────────────────────────────────────────────────────
+
+def build_scaler(songs_df: pd.DataFrame):
+    scaler = MinMaxScaler()
+    cols = [c for c in CONTENT_FEATURES if c in songs_df.columns]
+    scaled = songs_df.copy()
+    scaled[cols] = scaler.fit_transform(songs_df[cols].fillna(0))
+    return scaler, scaled, cols
+
+
+# ─────────────────────────────────────────────────────────────────
+#  SPOTIFY AUTH & PLAYBACK
+# ─────────────────────────────────────────────────────────────────
+
+def build_spotify_oauth() -> SpotifyOAuth:
+    return SpotifyOAuth(
+        client_id=os.environ.get("SPOTIPY_CLIENT_ID", ""),
+        client_secret=os.environ.get("SPOTIPY_CLIENT_SECRET", ""),
+        redirect_uri=os.environ.get("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:8080"),
+        scope=SPOTIFY_SCOPES,
+        cache_path=".spotify_cache",
+        open_browser=False,
+    )
+
+
+def get_spotify_client() -> spotipy.Spotify | None:
+    """Return an authenticated Spotify client, or None if not authed."""
+    try:
+        oauth = build_spotify_oauth()
+        token_info = oauth.get_cached_token()
+        if token_info:
+            return spotipy.Spotify(auth=token_info["access_token"])
+        return None
+    except Exception:
+        return None
+
+
+def get_auth_url() -> str:
+    return build_spotify_oauth().get_authorize_url()
+
+
+def exchange_code_for_token(code: str) -> dict | None:
+    try:
+        oauth = build_spotify_oauth()
+        return oauth.get_access_token(code, as_dict=True)
+    except Exception:
+        return None
+
+
+def get_active_device(sp: spotipy.Spotify) -> str | None:
+    try:
+        devices = sp.devices()
+        if not devices["devices"]:
+            return None
+        for d in devices["devices"]:
+            if d["is_active"]:
+                return d["id"]
+        return devices["devices"][0]["id"]
+    except Exception:
+        return None
+
+
+def search_and_get_track(sp: spotipy.Spotify, song_name: str, artist: str) -> dict | None:
+    """Search Spotify for a track. Returns full track object or None."""
+    try:
+        results = sp.search(
+            q=f"track:{song_name} artist:{artist}", type="track", limit=1
+        )
+        items = results["tracks"]["items"]
+        if not items:
+            results = sp.search(
+                q=f"{song_name} {artist}", type="track", limit=1
+            )
+            items = results["tracks"]["items"]
+        return items[0] if items else None
+    except Exception:
+        return None
+
+
+def play_song_on_spotify(
+    sp: spotipy.Spotify,
+    song_name: str,
+    artist: str,
+) -> tuple[str | None, str | None, str]:
+    """
+    Play a song on Spotify.
+    Returns (track_uri, album_cover_url, status_message).
+    """
+    device_id = get_active_device(sp)
+    if device_id is None:
+        return None, None, "NO_DEVICE"
+
+    track = search_and_get_track(sp, song_name, artist)
+    if track is None:
+        return None, None, f"NOT_FOUND"
+
+    uri = track["uri"]
+    album_cover = None
+    images = track.get("album", {}).get("images", [])
+    if images:
+        # Pick medium size (index 1) if available, else largest
+        album_cover = images[1]["url"] if len(images) > 1 else images[0]["url"]
+
+    try:
+        sp.start_playback(device_id=device_id, uris=[uri])
+        return uri, album_cover, "OK"
+    except spotipy.exceptions.SpotifyException as e:
+        if "Premium" in str(e):
+            return None, None, "NEEDS_PREMIUM"
+        return None, None, f"ERROR: {e}"
+
+
+def pause_spotify(sp: spotipy.Spotify):
+    try:
+        sp.pause_playback()
+    except Exception:
+        pass
+
+
+def set_volume(sp: spotipy.Spotify, level: int):
+    try:
+        sp.volume(max(0, min(100, level)))
+    except Exception:
+        pass
+
+
+def get_currently_playing(sp: spotipy.Spotify) -> dict | None:
+    """Return currently playing track info from Spotify."""
+    try:
+        result = sp.currently_playing()
+        if result and result.get("item"):
+            item = result["item"]
+            images = item.get("album", {}).get("images", [])
+            cover = images[1]["url"] if len(images) > 1 else (images[0]["url"] if images else None)
+            return {
+                "name":      item["name"],
+                "artist":    item["artists"][0]["name"],
+                "cover_url": cover,
+                "progress":  result.get("progress_ms", 0),
+                "duration":  item["duration_ms"],
+                "is_playing": result.get("is_playing", False),
+            }
+    except Exception:
+        pass
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────
+#  CAMELOT / SEQUENCER HELPERS
+# ─────────────────────────────────────────────────────────────────
+
+def camelot_from_key_mode(key: int, mode: int) -> str:
+    return CAMELOT_MAP.get((int(key), int(mode)), "unknown")
+
+
+def get_compatible_camelot_keys(camelot_key: str) -> list[str]:
+    if not camelot_key or camelot_key == "unknown":
+        return []
+    number   = int(camelot_key[:-1])
+    letter   = camelot_key[-1]
+    opposite = "A" if letter == "B" else "B"
+    prev_n   = 12 if number == 1  else number - 1
+    next_n   = 1  if number == 12 else number + 1
+    return [
+        f"{prev_n}{letter}",
+        f"{number}{letter}",
+        f"{next_n}{letter}",
+        f"{number}{opposite}",
+    ]
+
+
+def get_candidates(
+    conn: sqlite3.Connection,
+    current_song: pd.Series,
+    active_genres: list[str],
+    bpm_range: int = 8,
+    limit: int = 150,
+) -> pd.DataFrame:
+    keys = get_compatible_camelot_keys(current_song.get("camelot_key", ""))
+    genre_clause = ""
+    genre_params: list = []
+    if active_genres:
+        ph = ",".join(["?"] * len(active_genres))
+        genre_clause = f"AND track_genre IN ({ph})"
+        genre_params = list(active_genres)
+
+    if keys:
+        ph = ",".join(["?"] * len(keys))
+        q = f"""
+            SELECT * FROM songs
+            WHERE bpm BETWEEN ? AND ?
+            AND camelot_key IN ({ph})
+            AND id != ?
+            {genre_clause}
+            LIMIT {limit}
+        """
+        params = [
+            current_song["bpm"] - bpm_range,
+            current_song["bpm"] + bpm_range,
+            *keys,
+            current_song["id"],
+            *genre_params,
+        ]
+    else:
+        q = f"""
+            SELECT * FROM songs
+            WHERE bpm BETWEEN ? AND ?
+            AND id != ?
+            {genre_clause}
+            LIMIT {limit}
+        """
+        params = [
+            current_song["bpm"] - bpm_range,
+            current_song["bpm"] + bpm_range,
+            current_song["id"],
+            *genre_params,
+        ]
+
+    df = pd.read_sql(q, conn, params=params)
+    if df.empty and bpm_range < 20:
+        return get_candidates(conn, current_song, active_genres, bpm_range + 6, limit)
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────
+#  TRUESKILL RANKINGS  (per-genre + cross-genre)
+# ─────────────────────────────────────────────────────────────────
+
+TS_ENV = trueskill.TrueSkill(
+    mu=25.0, sigma=8.333, beta=4.167,
+    tau=0.083, draw_probability=0.1
+)
+
+
+def get_or_create_rating(
+    conn: sqlite3.Connection,
+    song_id: str,
+    genre: str,
+) -> trueskill.Rating:
+    row = pd.read_sql(
+        "SELECT mu, sigma FROM rankings WHERE song_id=? AND genre=?",
+        conn, params=[song_id, genre]
+    )
+    if row.empty:
+        return TS_ENV.create_rating()
+    return TS_ENV.create_rating(mu=row.iloc[0]["mu"], sigma=row.iloc[0]["sigma"])
+
+
+def save_rating(
+    conn: sqlite3.Connection,
+    song_id: str,
+    genre: str,
+    rating: trueskill.Rating,
+):
+    conn.execute("""
+        INSERT INTO rankings (song_id, genre, mu, sigma, comparison_count, last_updated)
+        VALUES (?, ?, ?, ?, 1, ?)
+        ON CONFLICT(song_id) DO UPDATE SET
+            genre             = excluded.genre,
+            mu                = excluded.mu,
+            sigma             = excluded.sigma,
+            comparison_count  = comparison_count + 1,
+            last_updated      = excluded.last_updated
+    """, (song_id, genre, rating.mu, rating.sigma, datetime.now().isoformat()))
+    conn.commit()
+
+
+def record_comparison(
+    conn: sqlite3.Connection,
+    winner_id: str,
+    loser_id: str,
+    genre: str,
+    draw: bool = False,
+):
+    wr = get_or_create_rating(conn, winner_id, genre)
+    lr = get_or_create_rating(conn, loser_id,  genre)
+    nw, nl = TS_ENV.rate_1vs1(wr, lr, drawn=draw)
+    save_rating(conn, winner_id, genre, nw)
+    save_rating(conn, loser_id,  genre, nl)
+    conn.execute(
+        "INSERT INTO comparisons (winner_id, loser_id, genre, timestamp) VALUES (?,?,?,?)",
+        (winner_id, loser_id, genre, datetime.now().isoformat())
+    )
+    conn.commit()
+
+
+def get_leaderboard(
+    conn: sqlite3.Connection,
+    genre: str | None = None,
+) -> pd.DataFrame:
+    """
+    genre=None  → cross-genre leaderboard (weighted by play-time proportion).
+    genre=str   → single-genre leaderboard.
+    """
+    if genre and genre != "__all__":
+        df = pd.read_sql("""
+            SELECT r.song_id, r.mu, r.sigma, r.comparison_count, r.genre,
+                   s.name, s.artist, s.bpm, s.energy, s.camelot_key,
+                   s.track_genre, s.album_cover_url,
+                   (r.mu - 2*r.sigma) AS raw_score
+            FROM rankings r
+            JOIN songs s ON r.song_id = s.id
+            WHERE r.genre = ?
+            ORDER BY raw_score DESC
+        """, conn, params=[genre])
+    else:
+        # Cross-genre: normalise each genre's scores to 0-1, then
+        # weight by that genre's share of total play time.
+        df = pd.read_sql("""
+            SELECT r.song_id, r.mu, r.sigma, r.comparison_count, r.genre,
+                   s.name, s.artist, s.bpm, s.energy, s.camelot_key,
+                   s.track_genre, s.album_cover_url,
+                   (r.mu - 2*r.sigma) AS raw_score
+            FROM rankings r
+            JOIN songs s ON r.song_id = s.id
+            ORDER BY raw_score DESC
+        """, conn)
+
+        if df.empty:
+            return df
+
+        # Play-time per genre
+        play_time = pd.read_sql("""
+            SELECT s.track_genre, SUM(le.play_time_s) AS total_time
+            FROM listening_events le
+            JOIN songs s ON le.song_id = s.id
+            GROUP BY s.track_genre
+        """, conn)
+
+        if play_time.empty or play_time["total_time"].sum() == 0:
+            # Fallback: equal weight across genres
+            genre_weight = {g: 1.0 for g in df["genre"].unique()}
+        else:
+            total = play_time["total_time"].sum()
+            genre_weight = dict(
+                zip(play_time["track_genre"],
+                    play_time["total_time"] / total)
+            )
+
+        # Normalise raw_score within each genre then weight
+        def norm_group(g):
+            mn, mx = g["raw_score"].min(), g["raw_score"].max()
+            g = g.copy()
+            g["norm_score"] = (g["raw_score"] - mn) / (mx - mn + 1e-9) if mx > mn else 0.5
+            gname = g["genre"].iloc[0]
+            g["weighted_score"] = g["norm_score"] * genre_weight.get(gname, 1.0)
+            return g
+
+        df = df.groupby("genre", group_keys=False).apply(norm_group)
+        df = df.sort_values("weighted_score", ascending=False)
+
+    return _add_normalised_score(df)
+
+
+def _add_normalised_score(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    col = "weighted_score" if "weighted_score" in df.columns else "raw_score"
+    mn, mx = df[col].min(), df[col].max()
+    df = df.copy()
+    df["score_0_10"] = (
+        ((df[col] - mn) / (mx - mn + 1e-9) * 10).round(1)
+        if mx > mn else 5.0
+    )
+    return df
+
+
+def pick_comparison_partner(
+    conn: sqlite3.Connection,
+    song_id: str,
+    genre: str,
+) -> str | None:
+    rating = get_or_create_rating(conn, song_id, genre)
+    ranked = pd.read_sql("""
+        SELECT song_id, mu FROM rankings
+        WHERE song_id != ? AND genre = ? AND comparison_count > 0
+    """, conn, params=[song_id, genre])
+
+    if ranked.empty:
+        fallback = pd.read_sql("""
+            SELECT DISTINCT song_id FROM listening_events
+            WHERE song_id != ?
+            LIMIT 30
+        """, conn, params=[song_id])
+        return None if fallback.empty else fallback.sample(1).iloc[0]["song_id"]
+
+    ranked["dist"] = abs(ranked["mu"] - rating.mu)
+    top5 = ranked.nsmallest(5, "dist")
+    return top5.sample(1).iloc[0]["song_id"]
+
+
+# ─────────────────────────────────────────────────────────────────
+#  ML SCORING  (content + ranking bias; collab when data is rich)
+# ─────────────────────────────────────────────────────────────────
+
+def get_content_scores(
+    all_songs_scaled: pd.DataFrame,
+    feature_cols: list[str],
+    conn: sqlite3.Connection,
+    candidate_ids: list[str],
+    active_genres: list[str],
+    top_n: int = 10,
+) -> dict[str, float]:
+    genre_clause = ""
+    params: list = [top_n]
+    if active_genres:
+        ph = ",".join(["?"] * len(active_genres))
+        genre_clause = f"AND s.track_genre IN ({ph})"
+        params = [*active_genres, top_n]
+
+    top = pd.read_sql(f"""
+        SELECT r.song_id, (r.mu - 2*r.sigma) AS s
+        FROM rankings r
+        JOIN songs s ON r.song_id = s.id
+        WHERE 1=1 {genre_clause}
+        ORDER BY s DESC LIMIT ?
+    """, conn, params=params)
+
+    if top.empty:
+        return {sid: 0.5 for sid in candidate_ids}
+
+    ref = all_songs_scaled[all_songs_scaled["id"].isin(top["song_id"])][feature_cols]
+    if ref.empty:
+        return {sid: 0.5 for sid in candidate_ids}
+
+    taste     = ref.values.mean(axis=0).reshape(1, -1)
+    cands     = all_songs_scaled[all_songs_scaled["id"].isin(candidate_ids)][["id"] + feature_cols]
+    sims      = cosine_similarity(taste, cands[feature_cols].values)[0]
+    return dict(zip(cands["id"].tolist(), sims.tolist()))
+
+
+def get_ranking_bias(
+    all_songs_scaled: pd.DataFrame,
+    feature_cols: list[str],
+    conn: sqlite3.Connection,
+    candidate_ids: list[str],
+) -> dict[str, float]:
+    rankings = pd.read_sql("""
+        SELECT song_id, (mu - 2*sigma) AS score
+        FROM rankings WHERE comparison_count >= 2
+    """, conn)
+
+    if rankings.empty:
+        return {sid: 0.5 for sid in candidate_ids}
+
+    rankings["normalized"] = (
+        (rankings["score"] - rankings["score"].min()) /
+        (rankings["score"].max() - rankings["score"].min() + 1e-9)
+    )
+    rf = all_songs_scaled[all_songs_scaled["id"].isin(rankings["song_id"])][["id"] + feature_cols]
+    rf = rf.merge(rankings[["song_id", "normalized"]], left_on="id", right_on="song_id")
+    cf = all_songs_scaled[all_songs_scaled["id"].isin(candidate_ids)][["id"] + feature_cols]
+
+    if rf.empty or cf.empty:
+        return {sid: 0.5 for sid in candidate_ids}
+
+    sim_mat = cosine_similarity(cf[feature_cols].values, rf[feature_cols].values)
+    scores  = sim_mat.dot(rf["normalized"].values) / (sim_mat.sum(axis=1) + 1e-9)
+    return dict(zip(cf["id"].tolist(), scores.tolist()))
+
+
+def get_hybrid_weight(conn: sqlite3.Connection) -> dict[str, float]:
+    count = pd.read_sql("SELECT COUNT(*) AS n FROM rankings", conn).iloc[0]["n"]
+    if count < 50:
+        return {"content": 0.80, "collab": 0.15, "bias": 0.05}
+    elif count < 200:
+        t = (count - 50) / 150
+        return {
+            "content": 0.80 - 0.55 * t,
+            "collab":  0.15 + 0.20 * t,
+            "bias":    0.05 + 0.20 * t,
+        }
+    return {"content": 0.25, "collab": 0.50, "bias": 0.25}
+
+
+def score_candidates(
+    conn: sqlite3.Connection,
+    all_songs_scaled: pd.DataFrame,
+    feature_cols: list[str],
+    candidates: pd.DataFrame,
+    active_genres: list[str],
+) -> pd.DataFrame:
+    ids = candidates["id"].tolist()
+    w   = get_hybrid_weight(conn)
+    cs  = get_content_scores(all_songs_scaled, feature_cols, conn, ids, active_genres)
+    bs  = get_ranking_bias(all_songs_scaled, feature_cols, conn, ids)
+    candidates = candidates.copy()
+    candidates["hybrid"] = candidates["id"].map(
+        lambda s: w["content"] * cs.get(s, 0.5) +
+                  (w["collab"] + w["bias"]) * bs.get(s, 0.5)
+    )
+    return candidates
+
+
+# ─────────────────────────────────────────────────────────────────
+#  NEXT SONG SELECTOR
+# ─────────────────────────────────────────────────────────────────
+
+def get_next_song(
+    conn: sqlite3.Connection,
+    all_songs_scaled: pd.DataFrame,
+    feature_cols: list[str],
+    current_song_id: str,
+    active_genres: list[str],
+    recently_played: list[str],
+    recently_played_artists: list[str],
+    energy_direction: str = "maintain",
+) -> pd.Series | None:
+
+    current = pd.read_sql(
+        "SELECT * FROM songs WHERE id=?", conn, params=[current_song_id]
+    )
+    if current.empty:
+        return None
+    current = current.iloc[0]
+
+    cands = get_candidates(conn, current, active_genres)
+
+    if recently_played:
+        cands = cands[~cands["id"].isin(recently_played)]
+    if recently_played_artists:
+        cands = cands[~cands["artist"].isin(recently_played_artists)]
+
+    # Progressive fallbacks
+    if cands.empty:
+        cands = get_candidates(conn, current, active_genres, bpm_range=15)
+        if recently_played:
+            cands = cands[~cands["id"].isin(recently_played)]
+    if cands.empty:
+        cands = get_candidates(conn, current, active_genres, bpm_range=20)
+    if cands.empty:
+        return None
+
+    cands = score_candidates(conn, all_songs_scaled, feature_cols, cands, active_genres)
+
+    if energy_direction == "build":
+        top  = cands.nlargest(20, "hybrid")
+        pick = top.loc[top["energy"].idxmax()]
+    elif energy_direction == "cool":
+        top  = cands.nlargest(20, "hybrid")
+        pick = top.loc[top["energy"].idxmin()]
+    else:
+        pick = cands.nlargest(1, "hybrid").iloc[0]
+
+    return pick
+
+
+def get_recommendations(
+    conn: sqlite3.Connection,
+    all_songs_scaled: pd.DataFrame,
+    feature_cols: list[str],
+    active_genres: list[str],
+    n: int = 15,
+) -> pd.DataFrame:
+    genre_clause = ""
+    params: list = [500]
+    if active_genres:
+        ph = ",".join(["?"] * len(active_genres))
+        genre_clause = f"WHERE track_genre IN ({ph})"
+        params = [*active_genres, 500]
+
+    cands = pd.read_sql(
+        f"SELECT id FROM songs {genre_clause} ORDER BY RANDOM() LIMIT ?",
+        conn, params=params
+    )
+    if cands.empty:
+        return pd.DataFrame()
+
+    all_songs = pd.read_sql("SELECT * FROM songs", conn)
+    ids = cands["id"].tolist()
+    w   = get_hybrid_weight(conn)
+    cs  = get_content_scores(all_songs_scaled, feature_cols, conn, ids, active_genres)
+    bs  = get_ranking_bias(all_songs_scaled, feature_cols, conn, ids)
+
+    results = pd.DataFrame([{
+        "song_id": sid,
+        "hybrid":  w["content"] * cs.get(sid, 0.5) + (w["collab"] + w["bias"]) * bs.get(sid, 0.5)
+    } for sid in ids]).sort_values("hybrid", ascending=False).head(n)
+
+    return results.merge(
+        all_songs[["id", "name", "artist", "bpm", "energy", "camelot_key",
+                   "track_genre", "album_cover_url"]],
+        left_on="song_id", right_on="id"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+#  LISTENING EVENT LOGGER
+# ─────────────────────────────────────────────────────────────────
+
+def log_listening_event(
+    conn: sqlite3.Connection,
+    song_id: str,
+    session_id: str,
+    skipped: bool = False,
+    replayed: bool = False,
+    play_time_s: float = 0.0,
+):
+    conn.execute("""
+        INSERT INTO listening_events
+            (song_id, played_at, session_id, skipped, replayed, play_time_s)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        song_id,
+        datetime.now().isoformat(),
+        session_id,
+        int(skipped),
+        int(replayed),
+        play_time_s,
+    ))
+    conn.commit()
+
+
+def update_play_time(conn: sqlite3.Connection, song_id: str, play_time_s: float):
+    """Update most recent listening event for a song with actual play time."""
+    conn.execute("""
+        UPDATE listening_events SET play_time_s = ?
+        WHERE song_id = ? AND id = (
+            SELECT id FROM listening_events WHERE song_id = ? ORDER BY id DESC LIMIT 1
+        )
+    """, (play_time_s, song_id, song_id))
+    conn.commit()
+
+
+def mark_skipped(conn: sqlite3.Connection, song_id: str):
+    conn.execute("""
+        UPDATE listening_events SET skipped = 1
+        WHERE song_id = ? AND id = (
+            SELECT id FROM listening_events WHERE song_id = ? ORDER BY id DESC LIMIT 1
+        )
+    """, (song_id, song_id))
+    conn.commit()
